@@ -278,7 +278,7 @@ function bindSettings(){document.querySelectorAll('[data-setting]').forEach(el=>
 function setBudget(n){state.answers.budget=n;$('budget').value=n;$('budgetError').textContent=''}
 function choose(key,value){state.answers[key]=value;state.weights[key]??=2;if(key==='use'&&value==='photo'){delete state.answers.camera}if(key==='use'&&value==='games'){delete state.answers.games}if(key==='type')delete state.answers.extra;render()}
 function back(){if(state.step>0){state.step--;render()}else goHome()}
-function next(){const qs=questions(),q=qs[state.step];if(q.budget&&(!Number.isInteger(state.answers.budget)||state.answers.budget<1||state.answers.budget>10000000)){$('budgetError').textContent='Введите целую сумму от 1 до 10 000 000 ₽.';$('budget').focus();return}if(!q.budget&&!state.answers[q.key])return;if(state.step<qs.length-1){state.step++;render();$('questionTitle').focus();window.scrollTo(0,0)}else{state.screen='results';state.feedback=null;track('quiz_complete',{category:state.cat,answers:{...state.answers},weights:{...state.weights},mandatory:{...state.mandatory},settings:{...state.settings}});track('recommendations_view',{category:state.cat,count:rank().length,answers:{...state.answers},weights:{...state.weights},mandatory:{...state.mandatory},settings:{...state.settings},recommendations:rank().map(p=>p.id)});render();window.scrollTo(0,0)}}
+function next(){const qs=questions(),q=qs[state.step];if(q.budget&&(!Number.isInteger(state.answers.budget)||state.answers.budget<1||state.answers.budget>10000000)){$('budgetError').textContent='Введите целую сумму от 1 до 10 000 000 ₽.';$('budget').focus();return}if(!q.budget&&!state.answers[q.key])return;if(state.step<qs.length-1){state.step++;render();$('questionTitle').focus();window.scrollTo(0,0)}else{state.screen='results';state.feedback=null;track('quiz_complete',{category:state.cat,answers:{...state.answers},weights:{...state.weights},mandatory:{...state.mandatory},settings:{...state.settings}});track('recommendations_view',{category:state.cat,count:rank().length,answers:{...state.answers},weights:{...state.weights},mandatory:{...state.mandatory},settings:{...state.settings},recommendations:rank().map(p=>p.id)});render();window.scrollTo(0,0);if(state.cat==='phone')void showAiPicks('')}}
 function suitableOffers(p){const s=state.settings;return offers.filter(o=>o.productId===p.id&&o.price<=state.answers.budget&&o.region===s.region&&(s.channel==='any'||s.channel===o.channel)&&(s.condition==='any'||s.condition===o.condition)&&(s.delivery!=='yes'||o.delivery))}
 function cameraRequested(){return state.cat==='phone'&&((state.answers.use==='photo'&&weight('use')>0)||(state.answers.camera==='high'&&weight('camera')>0))}
 function cameraFocus(){return cameraRequested()}
@@ -319,28 +319,39 @@ function feedback(value){state.feedback=value;track('recommendation_feedback',{v
 let modalVersion=0;function modal(html){modalVersion++;$('modalBody').innerHTML=html;if(!$('modal').open)$('modal').showModal()}
 
 let lastAiQuery='';
+const aiPendingSubmissions=new Map();let aiKnownJobs=[];
+try{const saved=JSON.parse(localStorage.getItem('picklio-ai-jobs')||'[]');if(Array.isArray(saved))aiKnownJobs=saved.filter(x=>typeof x.key==='string'&&/^[a-f0-9]{64}$/.test(x.id)&&Date.now()-x.savedAt<86400000).slice(-20)}catch{}
+function rememberAiJob(payload,job){if(!/^[a-f0-9]{64}$/.test(job?.id))return;const key=JSON.stringify(payload);aiKnownJobs=aiKnownJobs.filter(x=>x.key!==key);aiKnownJobs.push({key,id:job.id,savedAt:Date.now()});aiKnownJobs=aiKnownJobs.slice(-20);try{localStorage.setItem('picklio-ai-jobs',JSON.stringify(aiKnownJobs))}catch{}}
+async function readAiJob(endpoint,id){if(!/^[a-f0-9]{64}$/.test(id))throw Error('invalid_job');const response=await fetch(endpoint.href+'/'+id,{credentials:'omit',signal:AbortSignal.timeout(25000)});if(!response.ok)throw Error('ai_unavailable');return response.json()}
+async function submitAiJob(endpoint,payload){
+ const key=JSON.stringify(payload),known=aiKnownJobs.find(x=>x.key===key);
+ if(known)return readAiJob(endpoint,known.id);
+ if(aiPendingSubmissions.has(key))return aiPendingSubmissions.get(key);
+ const pending=(async()=>{const response=await fetch(endpoint.href,{method:'POST',credentials:'omit',headers:{'Content-Type':'application/json'},body:key,signal:AbortSignal.timeout(25000)});const job=await response.json();if(!response.ok)throw Error(job.error||'ai_unavailable');rememberAiJob(payload,job);return job})();
+ aiPendingSubmissions.set(key,pending);try{return await pending}finally{aiPendingSubmissions.delete(key)}
+}
 function openAiSearch(){modal('<h2>Найти подходящий смартфон</h2><p>Пожелания из анкеты уже учтены. Можно уточнить модель или бренд — поиск не ограничен тестовым каталогом.</p><label>Модель, бренд или уточнение (необязательно)<input id="aiQuery" maxlength="160" placeholder="Например, Nothing Phone или компактный смартфон" style="width:100%;padding:12px;margin:12px 0"></label><p class="small">Запрос и обезличенные предпочтения будут переданы Яндексу для веб-поиска. Личные данные из настроек не отправляются.</p><button id="aiSearchStart" class="primary">Найти варианты</button>');$('aiSearchStart').addEventListener('click',()=>showAiPicks($('aiQuery').value))}
-async function showAiPicks(query=''){lastAiQuery=query;
+async function showAiPicks(query='',resumeId=null,requestPayload=null){lastAiQuery=query;
  modal('<h2>Проверка по источникам</h2><p id="aiJobStatus" role="status">Готовим запрос…</p><p class="small">Поиск по открытому интернету. Цены, наличие и качество камеры могут требовать дополнительной проверки.</p>');
  const view=modalVersion;
  const stillOpen=()=>modalVersion===view&&$('modal').open;
+ let job=resumeId?{id:resumeId,status:'pending'}:null,payload=requestPayload;
+ const continueButton=()=>{const button=$('aiContinue');if(button)button.addEventListener('click',()=>showAiPicks(query,job?.id||null,payload))};
  const messages={ai_evidence_expired:'Сохранённые цены устарели. Нужна новая проверка источников; старые суммы скрыты.',ai_live_disabled:'Новые запросы ИИ сейчас отключены. Сохранённые результаты остаются доступны.',ai_not_configured:'ИИ ещё не подключён к этой версии сайта.',ai_budget_exhausted:'Пробный лимит запросов закрыт до сверки расходов.',unsupported_region:'В этом тесте есть данные только для России.',unsupported_condition:'В этом тесте проверяются только новые устройства.',unsupported_evidence:'Пока проверяются только смартфоны.',submission_not_confirmed_no_retry:'Отправка не подтверждена. Повторная платная генерация не запускается.',result_did_not_pass_validation:'Ответ не прошёл проверку источников и условий. Непроверенные рекомендации не показываем.'};
  try{
   const endpoint=new URL(PICKLIO_COLLECTOR_URL);endpoint.pathname=endpoint.pathname.replace(/events$/,'ai-jobs');
-  const clean=collectionPayload({category:state.cat,answers:state.answers,weights:state.weights,mandatory:state.mandatory,settings:state.settings});
-  const response=await fetch(endpoint.href,{method:'POST',credentials:'omit',headers:{'Content-Type':'application/json'},body:JSON.stringify({category:clean.category,answers:clean.answers,weights:clean.weights,mandatory:clean.mandatory,settings:clean.settings,query}),signal:AbortSignal.timeout(25000)});
-  let job=await response.json();if(!response.ok)throw Error(job.error||'ai_unavailable');
-  for(let count=0;count<12&&['pending','submitting'].includes(job.status);count++){
+  if(!payload){const clean=collectionPayload({category:state.cat,answers:state.answers,weights:state.weights,mandatory:state.mandatory,settings:state.settings});payload={category:clean.category,answers:clean.answers,weights:clean.weights,mandatory:clean.mandatory,settings:clean.settings,query}}
+  job=resumeId?await readAiJob(endpoint,resumeId):await submitAiJob(endpoint,payload);
+  const pollUntil=Date.now()+45000;
+  for(let count=0;count<12&&Date.now()<pollUntil&&['pending','submitting'].includes(job.status);count++){
    if(!stillOpen())return;
    $('aiJobStatus').textContent='Яндекс обрабатывает запрос. Повторное нажатие не создаёт ещё одну генерацию.';
    await new Promise(resolve=>setTimeout(resolve,2000));
    if(!stillOpen())return;
-   if(!/^[a-f0-9]{64}$/.test(job.id))throw Error('invalid_job');
-   const poll=await fetch(endpoint.href+'/'+job.id,{credentials:'omit',signal:AbortSignal.timeout(25000)});
-   if(!poll.ok)throw Error('ai_unavailable');job=await poll.json();
+   job=await readAiJob(endpoint,job.id);
   }
   if(!stillOpen())return;
-  if(['pending','submitting'].includes(job.status)){modal('<h2>Запрос ещё обрабатывается</h2><p>Задача сохранена. Можно проверить её позже — новая генерация не потребуется.</p><button class="secondary" onclick="showAiPicks(lastAiQuery)">Проверить состояние</button>');return}
+  if(['pending','submitting'].includes(job.status)){modal('<h2>Запрос ещё обрабатывается</h2><p>Задача сохранена. Продолжение получает тот же ответ без новой генерации.</p><button id="aiContinue" class="secondary">Продолжить получение ответа</button>');continueButton();return}
   if(job.status!=='completed'||!Array.isArray(job.result?.candidates))throw Error(job.error||'ai_unavailable');
   const safeUrl=value=>{try{const u=new URL(value);return u.protocol==='https:'&&!u.username&&!u.password?esc(u.href):null}catch{return null}};
   if(job.result.mode==='web'){
@@ -349,7 +360,7 @@ async function showAiPicks(query=''){lastAiQuery=query;
   }
   const rows=job.result.candidates.filter(x=>Number.isSafeInteger(x.offer?.priceRub)&&x.offer.priceRub>0&&x.offer.priceRub<=state.answers.budget);
   modal('<h2>Кандидаты для проверки</h2><p>ИИ сузил список по подготовленным источникам. Это пробная выборка из трёх моделей. Победитель по качеству камеры и автономности пока не определён.</p>'+rows.map(x=>'<div class="offer"><strong>'+esc(x.name)+'</strong><p>'+esc(x.variant)+'</p><p>'+money(x.offer.priceRub)+' · показанная цена, '+esc(x.offer.region)+'</p><p class="small">Цена из поискового индекса на '+esc(x.offer.observedDate)+'. Наличие, оплата и доставка не подтверждены.</p>'+x.facts.map(f=>'<p class="small">'+esc(f.text)+(safeUrl(f.url)?' <a href="'+safeUrl(f.url)+'" target="_blank" rel="noopener noreferrer">Источник ↗</a>':'')+'</p>').join('')+(safeUrl(x.offer.url)?'<a href="'+safeUrl(x.offer.url)+'" target="_blank" rel="noopener noreferrer">Проверить предложение магазина ↗</a>':'')+'</div>').join('')+(!rows.length?'<p>Нет моделей с подходящей показанной ценой и подтверждёнными обязательными условиями. Это не означает, что их нет на рынке.</p>':'')+'<p class="small">Мегапиксели не заменяют тест камеры, а ёмкость батареи — тест времени работы. Результат сохранён; повторное открытие той же анкеты не оплачивается заново.</p>');
- }catch(e){if(stillOpen())modal('<h2>Проверка по источникам</h2><p role="status">'+esc(messages[e.message]||'Связь с сервисом прервалась. Запрос не повторяется автоматически. Его состояние можно проверить позже.')+'</p>')}
+ }catch(e){if(stillOpen()){modal('<h2>Не удалось получить ответ</h2><p role="status">'+esc(messages[e.message]||'Связь с сервисом прервалась. Запрос не повторяется автоматически. Можно продолжить получение сохранённого ответа.')+'</p>'+(!messages[e.message]||job?.id?'<button id="aiContinue" class="secondary">'+(job?.id?'Продолжить получение ответа':'Проверить отправленный запрос')+'</button>':''));continueButton()}}
 }
 
 async function showOzonOffers(){
