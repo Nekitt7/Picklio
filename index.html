@@ -62,7 +62,7 @@ function rememberAiJob(payload,job){if(!/^[a-f0-9]{64}$/.test(job?.id))return;co
 async function readAiJob(endpoint,id){if(!/^[a-f0-9]{64}$/.test(id))throw Error('invalid_job');const response=await fetch(endpoint.href+'/'+id,{credentials:'omit',signal:AbortSignal.timeout(25000)});if(!response.ok)throw Error('ai_unavailable');return response.json()}
 async function submitAiJob(endpoint,payload){
  const key=JSON.stringify(payload),known=aiKnownJobs.find(x=>x.key===key);
- if(known)return readAiJob(endpoint,known.id);
+ if(known){const previous=await readAiJob(endpoint,known.id);if(previous.status!=='blocked'||previous.error!=='ai_budget_exhausted')return previous;aiKnownJobs=aiKnownJobs.filter(x=>x.key!==key)}
  if(aiPendingSubmissions.has(key))return aiPendingSubmissions.get(key);
  const pending=(async()=>{const response=await fetch(endpoint.href,{method:'POST',credentials:'omit',headers:{'Content-Type':'application/json'},body:key,signal:AbortSignal.timeout(25000)});const job=await response.json();if(!response.ok)throw Error(job.error||'ai_unavailable');rememberAiJob(payload,job);return job})();
  aiPendingSubmissions.set(key,pending);try{return await pending}finally{aiPendingSubmissions.delete(key)}
